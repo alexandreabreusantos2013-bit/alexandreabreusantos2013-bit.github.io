@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alexandre Santos | Portfolio</title>
+<style>
+  :root {
+    --bg: #f8f9fa;
+    --surface: #ffffff;
+    --text: #2d3436;
+    --muted: #636e72;
+    --accent: #3a86ff;
+    --accent-soft: #e1f0ff;
+    --border: #eceff1;
+    --shadow: 0 4px 6px rgba(0,0,0,.05);
+    --shadow-hover: 0 10px 20px rgba(0,0,0,.1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151a;
+      --surface: #1b2028;
+      --text: #e9edf1;
+      --muted: #9aa5b1;
+      --accent: #6aa5ff;
+      --accent-soft: #1d2b44;
+      --border: #272e38;
+      --shadow: 0 4px 6px rgba(0,0,0,.3);
+      --shadow-hover: 0 10px 20px rgba(0,0,0,.5);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    line-height: 1.55;
+  }
+  header {
+    width: 100%;
+    min-height: 55vh;
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    padding: 40px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  h1 { font-size: clamp(2.2rem, 8vw, 3.5rem); margin: 0; letter-spacing: 2px; }
+  .subtitle { font-size: 1.2em; color: var(--accent); font-weight: 600; margin: 10px 0 0; }
+  .container { max-width: 900px; width: 100%; padding: 40px 16px; }
+  .section-title { border-left: 5px solid var(--accent); padding-left: 15px; margin: 50px 0 24px; }
+  .section-title:first-child { margin-top: 0; }
+  .card {
+    background: var(--surface);
+    padding: 25px;
+    border-radius: 15px;
+    box-shadow: var(--shadow);
+    border: 1px solid var(--border);
+    display: block;
+    text-decoration: none;
+    color: inherit;
+  }
+  .card h3 { margin: 10px 0 6px; color: var(--accent); }
+  .card p { margin: 0; color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; }
+  a.card { transition: transform .2s, box-shadow .2s, border-color .2s; }
+  a.card:hover, a.card:focus-visible { transform: translateY(-5px); box-shadow: var(--shadow-hover); border-color: var(--accent); outline: none; }
+  .badge { background: var(--accent-soft); color: var(--accent); padding: 5px 12px; border-radius: 20px; font-size: .8em; font-weight: bold; display: inline-block; }
+  .numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-top: 20px; }
+  .numbers div { background: var(--accent-soft); border-radius: 12px; padding: 14px; text-align: center; }
+  .numbers strong { display: block; font-size: 1.6em; color: var(--accent); }
+  .numbers span { font-size: .85em; color: var(--muted); }
+  footer { margin-top: auto; padding: 40px 16px; color: var(--muted); font-size: .9em; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ALEXANDRE SANTOS</h1>
+  <p class="subtitle">Criador do Quelhas, do seu bot e de jogos de tabuleiro online</p>
+</header>
+
+<div class="container">
+
+  <h2 class="section-title">Sobre mim</h2>
+  <div class="card">
+    <p>Olá! Sou o Alexandre. Gosto de pegar num jogo e perceber a fundo como se ganha. O meu projeto principal é o <strong>Quelhas</strong>, um jogo do CNJM em que perde quem faz a última jogada: construí o site, a inteligência artificial que joga contra ti, as análises dos jogos reais e o canal de YouTube onde explico tudo.</p>
+    <div class="numbers">
+      <div><strong>5</strong><span>níveis de bot no Quelhas</span></div>
+      <div><strong>18+</strong><span>jogos na app</span></div>
+      <div><strong>5</strong><span>línguas na app</span></div>
+    </div>
+  </div>
+
+  <h2 class="section-title">Projetos e links</h2>
+  <div class="grid">
+
+    <a class="card" href="https://quelhas-privado.asantos-prog.workers.dev/" target="_blank" rel="noopener">
+      <span class="badge">JOGAR ONLINE</span>
+      <h3>Quelhas 10×10</h3>
+      <p>O jogo no browser, com cinco níveis de bot, regra da troca e estatísticas dos teus jogos.</p>
+    </a>
+
+    <div class="card">
+      <span class="badge">APP ANDROID · EM BREVE</span>
+      <h3>Playviro</h3>
+      <p>Dezenas de jogos num só sítio: Quelhas, Produto, Atari Go, Damas, cartas e muito mais, sem anúncios.</p>
+    </div>
+
+    <a class="card" href="https://www.youtube.com/@quelhas-p2x" target="_blank" rel="noopener">
+      <span class="badge">YOUTUBE</span>
+      <h3>Canal do Quelhas</h3>
+      <p>Vídeos e shorts sobre estratégia, aberturas e como o bot pensa.</p>
+    </a>
+
+    <a class="card" href="https://www.ua.pt/pt/fabrica/cnjm19" target="_blank" rel="noopener">
+      <span class="badge">CNJM 19</span>
+      <h3>Campeonato Nacional de Jogos Matemáticos</h3>
+      <p>A página oficial do 19.º CNJM, na Universidade de Aveiro, de onde vêm os jogos.</p>
+    </a>
+
+  </div>
+
+</div>
+
+<footer>© 2026 Alexandre Santos</footer>
+
+</body>
+</html>
