@@ -4,10 +4,13 @@
  * Interface: module.exports = { escolherJogada(tab, orient, opc) }
  *
  * Como decide uma jogada (opc.tempoMs é limite duro; usa no máximo min(0.8*tempo, tempo-90) ms):
- *   1. livro de aberturas (posições fixas, com as 4 simetrias que preservam V/H);
- *   2. alfa-beta (PVS + TT + killers + history) com avaliação aprendida, para ordenar as jogadas da raiz;
- *   3. verificação exata das melhores jogadas pelo solver por regiões, em rondas com top-K e orçamento
- *      de nós crescentes: joga uma vitória provada, nunca joga uma jogada provada perdedora se houver outra.
+ *   1. livro de aberturas (V abre com a coluna 4 inteira; 2.ª jogada de V calculada com 12 s para cada
+ *      resposta de H), consultado nas 4 simetrias que preservam V/H;
+ *   2. se a posição já foi provada ganha numa jogada anterior (TT do solver), recupera a jogada da prova;
+ *   3. alfa-beta (PVS + TT + killers + history) com avaliação aprendida, para ordenar as jogadas da raiz;
+ *   4. verificação exata das melhores jogadas pelo solver por regiões, em rondas com top-K e orçamento
+ *      de nós crescentes: joga uma vitória provada, nunca joga uma jogada provada perdedora se houver outra;
+ *      se todas perdem, escolhe a de refutação mais cara.
  *
  * Solver exato: o tabuleiro decompõe-se em regiões independentes (componentes 4-conexas de casas livres).
  * Uma região em linha reta só serve a um jogador (run exclusiva) e resume-se à sua classe floor(L/2)-1
@@ -15,11 +18,12 @@
  * encurtar em 2 a de menor classe >= 1). As outras regiões ficam num pool imutável; uma jogada só
  * recalcula a região onde foi feita. Chave da TT: soma dos hashes canónicos das regiões (invariantes por
  * translação e pelas 2 reflexões que preservam V/H; com H a jogar usa-se a transposta) + contadores.
+ * TT com baldes de 2 entradas (a mais trabalhosa fica), persistente entre jogadas.
  *
- * Avaliação: regressão logística sobre 44 características globais (runs exclusivas/disputadas por classe,
+ * Avaliação: rede 148-8-1 sobre 44 características globais (runs exclusivas/disputadas por classe,
  * mobilidade, casas disputadas e privadas, runs partíveis...) + 88 classes de padrões 3x3, treinada com
- * rótulos do solver exato (posições até ~80 casas vivas) e com o resultado do 1.º ponto provado em
- * partidas de auto-jogo (posições anteriores).
+ * rótulos do solver exato e, nas posições anteriores ao 1.º ponto provado, com o valor desse ponto,
+ * em 3 gerações de auto-jogo (ver ferramentas/).
  *
  * Teorema usado (exato): sem casas disputadas, quem tem a vez ganha sse tiver <= runs que o adversário.
  *
@@ -177,7 +181,8 @@ function carregarSolver() {   // nível 0 a partir de rowM
   decompor(0);
 }
 const SBITS = 23, SMASK = (1 << SBITS) - 1;
-const sKey = new Int32Array(1 << SBITS), sVal = new Uint8Array(1 << SBITS);   // valor: 6 bits extra da chave | 1 ganha / 2 perde
+// baldes de 2 entradas; em caso de conflito substitui-se a de menor trabalho (log2 dos nós da subárvore)
+const sKey = new Int32Array(1 << SBITS), sVal = new Uint8Array(1 << SBITS), sWork = new Uint8Array(1 << SBITS);   // valor: 6 bits extra da chave | 1 ganha / 2 perde
 let sNodes = 0, sNodeLim = Infinity;
 const SBUF = []; for (let i = 0; i < MAXP; i++) SBUF.push(new Int32Array(1024));
 const ABS = 63;      // índice de região especial: jogada abstrata numa run exclusiva
@@ -245,8 +250,12 @@ function resolve(p, side) {
     k1 = k1 + Math.imul(a, ZC1[i]) + Math.imul(b, ZC1[5 + i]) | 0;
     k2 = k2 + Math.imul(a, ZC2[i]) + Math.imul(b, ZC2[5 + i]) | 0;
   }
-  const ei = k1 & SMASK, ev = sVal[ei], tag = (k1 >>> 26) << 2;
-  if (ev !== 0 && sKey[ei] === k2 && (ev & 0xFC) === tag) return (ev & 3) === 1;
+  const e0 = k1 & (SMASK - 1), tag = (k1 >>> 26) << 2;
+  let ev = sVal[e0];
+  if (ev !== 0 && sKey[e0] === k2 && (ev & 0xFC) === tag) return (ev & 3) === 1;
+  ev = sVal[e0 + 1];
+  if (ev !== 0 && sKey[e0 + 1] === k2 && (ev & 0xFC) === tag) return (ev & 3) === 1;
+  const n0 = sNodes;
   const buf = SBUF[p], m = gerarSolver(p, side, buf);
   buf.subarray(0, m).sort();
   const save = poolTop;
@@ -257,7 +266,13 @@ function resolve(p, side) {
     poolTop = save;
     if (!w) { win = true; break; }
   }
-  sKey[ei] = k2; sVal[ei] = tag | (win ? 1 : 2);
+  // lugar e0 guarda a entrada mais trabalhosa; e0+1 é de substituição sempre
+  const wk = 32 - Math.clz32(sNodes - n0 + 1);
+  let ej;
+  if (sKey[e0] === k2 && (sVal[e0] & 0xFC) === tag) ej = e0;
+  else if (sKey[e0 + 1] === k2 && (sVal[e0 + 1] & 0xFC) === tag) ej = e0 + 1;
+  else ej = wk >= sWork[e0] ? e0 : e0 + 1;
+  sKey[ej] = k2; sVal[ej] = tag | (win ? 1 : 2); sWork[ej] = wk;
   return win;
 }
 
@@ -322,25 +337,39 @@ function globais(R, C) {
   return i;
 }
 // logit da vitória de quem tem a vez (R/C: linhas/colunas da vista canónica)
+const PIDX = new Int16Array(100), HACC = new Float64Array(64);
 function avaliarML(R, C) {
   const ng = globais(R, C);
-  let z = MOD_B;
-  for (let j = 0; j < ng; j++) z += MOD_WG[j] * G[j];
+  let np = 0;
   for (let r = 1; r <= 10; r++) {
     let f = Rp[r];
     if (!f) continue;
     const up2 = Rp[r - 1] << 1, md2 = f << 1, dn2 = Rp[r + 1] << 1;
     while (f) {
       const b = f & -f; f ^= b; const c = CTZ[b], x = (md2 >> c) & 7;
-      z += MOD_WP[PAT[((up2 >> c) & 7) | ((x & 1) << 3) | ((x >> 2) << 4) | (((dn2 >> c) & 7) << 5)]];
+      PIDX[np++] = PAT[((up2 >> c) & 7) | ((x & 1) << 3) | ((x >> 2) << 4) | (((dn2 >> c) & 7) << 5)];
     }
+  }
+  if (MOD_HID === 0) {
+    let z = MOD_B;
+    for (let j = 0; j < ng; j++) z += MOD_WG[j] * G[j];
+    for (let k = 0; k < np; k++) z += MOD_WP[PIDX[k]];
+    return z;
+  }
+  let z = MOD_B;
+  for (let h = 0; h < MOD_HID; h++) {
+    let a = MOD_B1[h]; const og = h * NG, op = h * NPAT;
+    for (let j = 0; j < ng; j++) a += MOD_WG[og + j] * G[j];
+    for (let k = 0; k < np; k++) a += MOD_WP[op + PIDX[k]];
+    z += MOD_W2[h] * (a > 0 ? a : 0.01 * a);
   }
   return z;
 }
 // @@MODELO@@
-const MODELO_EMB = { HID: 0, WG: [0.075787,0.29564,0.066202,-0.070899,-0.20225,0.099036,0.98332,0.84083,0.22483,0.31136,-0.6147,0.43994,-0.076476,0.10132,-0.15394,0.045603,0.17538,-0.12493,0.091686,-0.065675,0.30818,-0.23013,-0.28783,0.21072,0.29995,-0.2383,-0.19253,-0.039544,0.23404,-0.37972,0.081734,-0.0365,-0.54545,5.9255,0.8352,-0.56776,0.4895,-0.18577,-0.06245,0.017622,-0.51225,-1.0328,0.51225,0.29975,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], WP: [0.10393,0.049128,-0.19158,-0.26807,-0.5993,-0.11367,0.20041,0.29086,-0.074826,0.0046894,0.12326,0.11298,0.22139,0.088714,-0.14842,-0.17116,0.63274,0.018493,0.17991,-0.021795,1.6962,-0.11413,-0.1131,0,0,0.19963,-1.7395,-0.25561,-0.2272,0.05644,0.25868,1.1251,-0.055038,0.17686,4.8301,0.1349,-0.87199,1.0582,0.063226,0.15714,-0.091496,0.79795,0.17678,0.33221,-0.31914,0.2285,0.038197,0.195,0.245,-3.8972,0.23436,-0.86726,0.064239,1.8384,-0.56862,0.031001,0,-0.019324,-1.3246,-0.30019,-0.24412,-1.4412,-0.26856,0.22342,0.045373,-0.014479,-0.084601,-0.043695,3.1215,-0.66666,0.028416,0.48444,0.026959,0.051447,-0.0076538,0,1.4831,-1.5049,-0.15106,-0.11042,-0.091003,0.16804,0.05829,0.00041862], B1: [], W2: [], B2: -1.9885 };
+const MODELO_EMB = { HID: 8, WG: [-0.10952,-0.17956,-0.041363,-0.00031809,0.0070657,-0.24711,-1.9854,-0.41307,-0.19271,-0.25569,0.58753,-0.31945,0.092394,-0.029649,0.71099,-0.024671,-0.27774,0.088644,0.38426,-0.008509,-0.12647,0.086909,-0.56545,-0.0051856,-0.25879,0.048904,-1.0654,-0.46512,-0.43398,0.23909,-0.074801,-0.011291,0.082258,-1.3184,-0.42218,0.42795,-0.29108,-0.06109,0.12448,0.042764,0.2916,0.4757,0.075829,-2.1005,1.2418e-305,-3.9541e-304,7.4088e-304,2.1939e-306,1.0557e-304,-8.5015e-304,-8.3277e-305,4.6803e-304,4.5017e-304,-4.8083e-304,-7.8082e-305,-2.4441e-304,2.2879e-303,3.2222e-304,-8.6346e-303,-1.0247e-303,-2.2794e-304,-1.3724e-304,-1.3065e-304,2.3045e-306,-0.42654,-0.1757,0.027124,-0.032411,-0.12876,0.11802,-0.6954,0.57093,-0.042006,-0.1207,0.23674,-0.26012,0.032007,0.12329,0.54474,-0.62996,0.0056511,-0.030302,0.038133,0.01155,0.11784,-0.26294,-0.82132,-0.83658,-0.025712,-0.009099,-0.91119,0.11519,-0.033172,-0.11508,0.020661,-0.000536,-0.73835,0.7885,-0.089385,-0.95684,0.25505,0.013952,0.014883,0.0028281,-0.99368,-0.79746,0.33728,-0.38007,3.2235e-304,-2.6373e-304,2.1133e-303,7.5208e-304,3.0984e-304,-1.3627e-304,2.8341e-303,3.0984e-303,3.1081e-304,-4.1661e-303,4.1377e-304,4.3836e-304,2.5833e-305,-1.5261e-303,5.0303e-303,1.4972e-304,4.4504e-303,1.4901e-304,-4.0357e-303,5.4908e-304,0.17619,0.12132,0.0036429,0.031992,-0.010739,0.041903,-0.42837,0.43469,0.28366,0.26947,0.11555,-0.11589,0.018809,0.031754,-0.99671,0.48243,-0.050418,0.027778,-0.4477,-0.86123,0.11555,0.11753,-0.4943,0.25014,0.11487,-0.014855,-0.11435,-2.4243,-0.083897,-0.40695,0.035275,-0.03426,-0.46041,0.71704,0.36276,-0.22267,0.11638,-0.23166,-0.027363,0.028518,0.38615,0.33502,-0.29233,-0.035484,1.045e-304,1.1116e-303,7.2075e-304,3.0104e-303,2.6176e-304,1.2255e-303,-3.1061e-304,-3.7195e-304,5.098e-305,1.0571e-304,1.2309e-304,-3.5242e-303,6.3013e-305,7.9831e-305,4.1775e-304,3.7856e-304,-3.9069e-304,5.6156e-303,-1.9565e-304,-2.5092e-304,0.33828,0.089854,0.0032047,0.093348,0.029799,-0.075289,-0.54662,0.79302,0.046317,-0.15183,-0.65333,0.42651,-0.00022296,0.024323,-0.4505,0.042174,0.019717,0.026673,-0.17084,-0.61981,-0.019084,-0.080287,0.22013,-0.56041,0.035531,-0.072631,-0.46109,-1.0926,0.10382,-0.16169,0.0055002,-0.01087,-0.40864,1.379,0.24382,-0.50599,0.18024,-0.093852,0.037294,-0.030099,0.51833,0.36835,-0.88709,-7.2942,-7.1326e-306,-5.1416e-304,3.9697e-307,1.6237e-304,-3.6182e-304,-1.5287e-304,-1.9059e-305,-4.5375e-303,-2.4241e-304,-3.1171e-304,1.1602e-303,4.3839e-305,2.8588e-305,7.7796e-305,-2.2151e-304,4.5503e-304,9.1803e-303,2.7168e-304,5.6074e-305,5.8727e-305,0.53583,-0.46789,0.0090326,0.010572,-0.10389,-0.010621,-0.68931,-0.4295,-0.065973,0.0053919,0.60568,-0.85799,0.059603,-0.0096262,0.56735,-0.206,-0.02917,-0.0032791,-0.15346,-0.33477,-0.09744,0.11404,0.072244,-0.20178,-0.27131,0.14319,-1.583,-0.1132,-0.59698,0.14861,-0.027904,-0.0061903,-0.71186,-0.83933,-0.42693,0.30046,-0.22688,0.21161,0.031198,0.04828,0.65975,0.52841,-0.45015,-1.6201,-5.9511e-305,2.2157e-304,1.0173e-304,-1.1801e-303,-3.0746e-305,-5.9044e-306,-1.8278e-303,-3.8847e-304,2.1004e-304,-2.6031e-304,-9.5986e-305,-3.2975e-303,2.264e-304,9.9237e-304,-5.4536e-306,-1.341e-306,2.5577e-304,-4.2067e-305,3.0992e-304,-5.3659e-304,-0.03772,0.24261,-0.063107,0.11505,0.034234,0.085017,-0.92234,-0.48999,0.0936,0.052427,1.0399,0.42407,0.10919,0.02409,-0.43896,0.54679,-0.013035,0.027703,-0.83932,-0.16933,-0.26429,-0.023826,-2.5969,0.29952,-0.062953,0.04639,0.35715,-1.2949,-0.29563,0.021931,-0.060133,-0.0059415,1.0228,-0.71969,-1.0072,-0.017311,-0.10433,0.18176,0.011579,0.036713,0.47796,0.39169,-0.61257,-0.23713,8.4608e-305,-1.3158e-304,2.6426e-304,-8.6871e-305,6.1748e-304,6.2294e-304,1.2961e-303,-8.0463e-304,1.482e-303,2.536e-304,6.482e-307,6.7342e-305,6.2964e-304,-3.1547e-305,-1.216e-306,1.5353e-303,3.4464e-304,8.0187e-305,4.3048e-304,3.5162e-304,-0.42514,-0.16363,0.054793,0.033026,-0.048962,-0.050934,0.72006,0.17535,0.07025,0.16761,0.37066,0.37086,-0.036494,0.074132,0.30149,-0.24012,0.1757,-0.10402,-0.239,-0.29245,0.10036,0.069192,0.18432,-1.2039,0.23198,-0.29967,0.36948,-0.53622,-0.22005,-0.34241,0.019654,-0.0063901,-0.80369,0.6807,0.27427,-0.20803,0.2262,-0.17979,0.056059,0.045692,0.38344,0.24907,-0.21798,-0.6479,-4.5174e-304,-1.0762e-303,1.3009e-305,-1.3218e-304,2.9521e-303,-2.0882e-304,2.7039e-304,2.3498e-305,-3.8562e-305,3.4888e-304,2.2855e-305,1.288e-304,1.8833e-303,-5.886e-305,2.3805e-305,2.1185e-303,-4.5298e-306,4.1094e-306,9.8887e-304,4.6107e-305,0.30681,0.017384,0.03355,0.092499,0.035947,-0.045313,-0.64366,0.42255,0.1128,0.21612,-0.41678,0.081832,-0.015911,0.077538,0.15756,0.62515,0.048708,-0.084077,0.0047193,0.33068,0.27357,-0.067051,0.22443,-0.28079,0.077157,-0.17086,-0.27909,-1.9228,0.057524,-0.3604,0.056926,-0.017285,-0.11152,1.0867,0.24509,-0.10985,0.22556,-0.32292,0.058717,0.072329,0.19279,0.23536,-0.052961,-0.74636,-8.6023e-304,4.0711e-303,1.2544e-305,2.0324e-303,-6.7816e-306,-1.5198e-305,1.4018e-305,-2.0091e-303,1.1316e-304,4.2957e-304,5.0314e-304,-1.6119e-304,-1.611e-304,-2.9792e-304,1.0592e-303,-4.3608e-304,8.126e-304,1.133e-303,7.4074e-304,6.8466e-304], WP: [1.0365,-0.61544,0.087155,0.02317,3.315,-0.20548,-0.057509,-0.92945,-0.1965,0.038431,0.22213,-0.81001,1.0605,-0.55644,0.04606,0.054051,0.39874,-0.26597,-0.4787,0.012931,1.6488,0.052126,-0.46695,5.4224e-305,6.8675e-307,3.0122,-0.94871,0.55015,1.3495,-0.18316,2.7513,0.45313,2.3507,1.0424,9.5926,-0.86775,-3.1903,2.1721,0.032794,-0.60173,0.38749,3.656,-0.5,3.2522,0.030767,-0.14201,-0.52394,-0.090371,-0.27213,5.0842,0.7617,0.26906,-0.25011,3.1128,0.41742,-1.5367,1.9039e-306,1.3308,5.6984,1.4067,-0.45268,2.0666,-0.5335,0.57648,-0.049948,0.10608,-1.5573,-0.2861,1.2691,5.6278,1.0077,-0.60042,-0.80527,1.5771,-0.24906,-5.3931e-305,2.3907,3.0635,0.21016,6.7358,0.32659,-1.9514,-0.29791,-0.010567,-0.83063,-0.61737,-0.052493,-0.26841,0.058637,-0.34521,-0.033267,-0.089608,-0.11762,0.064675,0.90707,0.32155,0.86947,0.014764,-0.17466,-0.25274,-0.20994,-0.12613,-0.12774,-0.043682,7.634,-0.61189,-0.60616,4.6736e-305,3.3706e-304,0.13726,2.5824,-1.033,1.9937,-0.18767,-3.3614,-1.4449,-4.2734,-0.14823,13.244,-2.6837,0.61507,-0.28354,0.25754,0.34549,0.68131,2.1905,0.3309,0.84269,-0.14734,-0.7713,-0.066044,0.015535,0.16469,6.5707,-0.50925,-0.16867,0.014108,-3.2668,1.2671,0.0081162,6.1873e-306,6.0632,4.2431,0.80707,0.17369,-0.15376,-1.1884,0.12033,-0.0059979,-0.13053,-0.85458,-0.079571,6.6317,2.6271,-0.12613,-0.26787,-0.38666,0.86731,-0.029132,-2.4677e-306,4.6645,6.8976,-0.69907,3.2543,0.19991,-4.6171,-0.2839,-0.0021411,-0.92708,0.5148,-0.079197,-0.52798,1.4115,0.23443,0.11057,0.059035,-0.44838,0.01662,0.73734,0.22378,0.57041,0.46374,-0.11348,0.21713,1.0348,0.47937,-0.18726,0.017631,-3.4867,0.16625,0.5954,2.6981e-305,2.0355e-306,0.53825,0.55803,2.3913,0.043503,0.2026,4.8046,2.5949,-0.37742,1.2955,1.8489,2.0049,7.3571,2.0544,0.54573,0.25126,0.11903,1.3616,0.015871,1.1172,-0.80108,-0.64491,0.10759,0.089535,0.10975,-1.8572,1.61,-0.5406,0.14392,2.4395,-2.0171,0.79955,-1.3201e-306,1.5498,1.2089,-0.95487,-0.077025,-4.3506,-0.0076384,-0.17502,0.01621,1.641,0.085914,0.19337,-3.6102,-5.8751,-0.45674,0.83654,0.97979,0.53352,0.05554,4.0779e-305,-6.6265,-7.7511,0.59309,8.7542,0.16219,5.297,0.09101,-0.039659,0.81557,-0.35704,-0.053775,-0.086695,-0.44848,-0.70978,0.019777,0.00791,-0.06714,0.0076913,-0.018932,0.30076,-0.413,-0.063823,-0.072819,0.17991,-0.044002,0.071682,-0.15317,0.0011157,4.0477,0.2056,-0.48313,-9.9065e-305,-8.6183e-306,-0.35985,-2.0972,0.53368,-0.2637,0.35142,-6.7457,1.7738,0.45763,-0.4714,-14.374,0.74785,-10.437,1.7557,0.093624,-0.82916,0.19419,-2.3192,0.50962,-0.13932,0.80929,-0.064723,-0.070032,0.10174,0.043556,6.313,-0.239,-0.54889,0.0098615,-8.1721,-4.6351,0.00080532,-3.8229e-305,-7.7323,-10.596,0.74534,-0.098117,-1.5716,0.69772,-0.94194,0.022313,0.35849,0.47711,0.17135,-17.449,-9.6358,-0.17477,-0.92729,-0.020133,-0.26102,-0.010655,7.6053e-304,-3.6968,-13.361,-0.20965,-18.548,-0.012941,-9.5643,-0.19272,-0.00032927,-0.59057,-0.98614,0.091812,-0.29508,-1.0734,1.3529,-0.22168,-0.028311,-0.2638,0.021445,-0.68938,0.25771,-1.0432,0.17455,0.10112,0.066513,-0.28988,0.22149,-0.092228,0.0023782,-13.262,-0.9064,0.088284,5.6374e-305,-1.7127e-305,-9.3262,0.10784,-0.73547,0.17653,0.3223,-0.85163,-11.253,-4.7409,0.17203,-18.647,1.2358,2.5099,1.7784,0.28635,0.45192,0.88089,-8.5076,-0.14716,-1.052,-0.050304,-0.11279,-0.054227,-0.066149,0.075492,6.5454,-0.09433,0.1414,0.35283,-16.11,1.7681,0.84056,2.3275e-305,1.4351,-14.503,0.18357,-0.32689,-0.28356,0.63705,-0.20243,0.013042,0.55382,0.76483,-0.044514,-13.854,-12.321,-1.1953,-0.94146,0.11256,0.26047,-0.035563,-1.0582e-305,-13.801,1.6242,0.14922,1.9795,0.12364,2.3417,-0.11063,-0.027971,-0.32383,-0.62538,-0.048083,-0.31603,-1.0278,-0.59169,-0.11028,-0.15895,-0.25791,0.079745,0.084137,-0.43479,1.8117,-0.16982,0.034895,0.12251,-0.63849,0.032107,-0.40831,0.015462,3.7751,1.5731,0.12884,4.4532e-305,-7.1461e-305,2.4191,0.65784,0.54037,1.5849,-0.16068,0.77702,4.6352,0.98949,0.36931,4.1094,0.0015179,3.8359,0.15238,0.34277,-0.97768,-0.38906,-0.064757,0.3168,-0.86853,0.84277,-1.2648,0.058035,-0.20238,-0.085188,1.9831,0.59258,-0.11955,-0.080764,3.4978,-1.8075,0.28361,-3.955e-305,2.3033,10.502,-0.34488,0.0039461,1.7575,2.5834,-0.1052,-0.035061,0.71217,-0.84233,0.070045,0.41254,-3.3676,2.0119,0.52366,-0.03923,0.8439,-0.001452,-2.3314e-305,2.7666,-1.1448,-1.0631,-1.4105,-0.34198,-4.1927,-0.088806,-0.024819,0.35407,-1.5928,0.023662,-0.50425,0.32876,3.0699,0.12989,0.094474,-0.18087,0.047112,0.37181,-0.55557,1.2273,-0.049243,-0.036906,-0.49328,-0.0036268,-0.30328,-0.083036,-0.020516,-3.0432,1.1504,-0.32122,-2.4267e-305,-6.3616e-305,-1.8781,-0.28521,-2.6206,0.10084,-0.45201,3.0601,-3.1371,2.2434,0.30248,17.735,0.5312,2.9191,2.8431,0.38206,-0.2845,0.33058,3.1423,-1.2033,1.1363,0.10623,0.22701,-0.043661,0.068631,-0.029866,9.4922,-0.12223,-0.33124,-0.17189,1.6474,-3.5053,0.64663,1.075e-304,-3.8047,-4.9703,0.36314,-0.30692,2.0312,1.2899,0.68383,0.025259,-0.32875,-0.1356,-0.36356,6.2764,-0.11166,0.36422,0.35214,-0.19855,-0.066796,-0.18346,1.9067e-308,4.254,-2.6058,1.2181,-2.5088,-0.46607,0.061573,0.066753,-0.00012386,0.54602,-0.36194,-0.0054721,-0.080468,0.82856,-1.4009,0.087587,-0.42263,-0.31815,0.026943,-1.7545,-0.91597,0.41915,-0.3289,-0.037716,-0.048894,0.84505,0.030476,-0.55747,-0.017226,-4.4587,-0.83344,0.052857,1.2194e-305,-6.1023e-306,4.0301,-2.985,-2.4788,0.69972,-0.066511,-1.8287,1.173,0.80539,1.2247,-6.9329,-2.622,-6.545,0.95293,-0.5757,0.3308,0.58263,1.024,-0.32347,-0.34984,-0.27657,-1.0916,-0.051989,0.061387,-0.026647,3.5133,-0.27777,-0.10438,0.16991,6.5981,2.6046,-0.81998,2.1175e-305,3.2625,5.0224,-0.82767,-0.51258,1.6939,1.6312,0.071459,0.025669,-2.6942,-0.59771,-0.30177,2.047,1.268,0.91708,-0.067718,0.60734,1.3333,-0.2229,-3.4621e-304,-7.327,2.3966,-3.386,0.087135,-0.15159,-4.3474,0.22966,-0.034661], B1: [5.8823,1.5606,-0.42647,1.273,0.61328,0.47313,-0.95365,2.0518], W2: [-0.72648,0.77084,0.49494,0.71452,-0.7858,-0.74924,0.82152,0.56639], B2: -0.13608 };
 // @@FIM_MODELO@@
-const MOD_B = MODELO_EMB.B2, MOD_WG = Float64Array.from(MODELO_EMB.WG), MOD_WP = Float64Array.from(MODELO_EMB.WP);
+const MOD_HID = MODELO_EMB.HID, MOD_B = MODELO_EMB.B2, MOD_WG = Float64Array.from(MODELO_EMB.WG), MOD_WP = Float64Array.from(MODELO_EMB.WP);
+const MOD_B1 = Float64Array.from(MODELO_EMB.B1), MOD_W2 = Float64Array.from(MODELO_EMB.W2);
 
 // =====================================================================================
 // Alfa-beta
@@ -357,7 +386,7 @@ function resizeTT(bits) {
 resizeTT(20);
 const HIST = new Int32Array(8192), K1 = new Int32Array(128), K2 = new Int32Array(128);
 const MB = []; for (let i = 0; i < 128; i++) MB.push(new Int32Array(512));
-function limparTT() { tKey.fill(0); tFlag.fill(0); HIST.fill(0); sVal.fill(0); }
+function limparTT() { tKey.fill(0); tFlag.fill(0); HIST.fill(0); sVal.fill(0); sWork.fill(0); }
 
 // Jogada: dir<<12 | linha<<8 | inicio<<4 | comprimento   (dir 0 = V na coluna 'linha', 1 = H na linha 'linha')
 function make(m) {
@@ -567,6 +596,56 @@ function pensar(ord, t0, budget) {
   ord.sort((a, b) => ((b.mv === best) - (a.mv === best)) || (b.sc - a.sc));
   return best;
 }
+// valor da posição atual (rowM, side) na TT do solver: 1 ganha, 2 perde, 0 desconhecido (deixa o nível 0 carregado)
+function raizNaTT() {
+  carregarSolver();
+  const n = NL[0], ME = side === 0 ? CNTV : CNTH, OP = side === 0 ? CNTH : CNTV;
+  if (n === 0) return ME[0] + ME[1] + ME[2] + ME[3] + ME[4] <= OP[0] + OP[1] + OP[2] + OP[3] + OP[4] ? 1 : 2;
+  let k1 = 0, k2 = 0; const ho = side === 0 ? 0 : 2;
+  for (let i = 0; i < n; i++) { const id = LIST[i]; k1 = k1 + CH[id * 4 + ho] | 0; k2 = k2 + CH[id * 4 + ho + 1] | 0; }
+  for (let i = 0; i < 5; i++) { const a = ME[i], b = OP[i]; k1 = k1 + Math.imul(a, ZC1[i]) + Math.imul(b, ZC1[5 + i]) | 0; k2 = k2 + Math.imul(a, ZC2[i]) + Math.imul(b, ZC2[5 + i]) | 0; }
+  const e0 = k1 & (SMASK - 1), tag = (k1 >>> 26) << 2;
+  for (let e = e0; e <= e0 + 1; e++) { const ev = sVal[e]; if (ev !== 0 && sKey[e] === k2 && (ev & 0xFC) === tag) return ev & 3; }
+  return 0;
+}
+// com a raiz já provada ganha: procura a jogada vencedora pela ordem do próprio solver (reaproveita a prova)
+function jogadaDaProva(tFim, raiz) {
+  deadline = tFim;
+  const buf = SBUF[0], m = gerarSolver(0, side, buf);
+  buf.subarray(0, m).sort();
+  const mvs = []; for (let i = m - 1; i >= 0; i--) mvs.push(buf[i] & 0x3FFFF);
+  const save = poolTop;
+  try {
+    for (const mv of mvs) {
+      fazer(0, side, mv);
+      const w = resolve(1, side ^ 1);
+      poolTop = save;
+      if (!w) return solverParaAB(mv, raiz);
+    }
+  } catch (e) { if (e !== ABORT) throw e; }
+  return 0;
+}
+// jogada do solver (nível 0) -> jogada da alfa-beta (da lista raiz). As abstratas (fechar / encurtar uma run
+// exclusiva da classe t) correspondem a qualquer jogada numa run exclusiva dessa classe que deixe as mesmas sobras.
+function solverParaAB(mv, raiz) {
+  if ((mv >>> 12) !== ABS) return (side << 12) | (mv & 4095);
+  const t = (mv >> 8) & 15, enc = mv & 1, A = side === 0 ? colM : rowM;
+  for (const x of raiz) {
+    if ((x >> 12) !== side) continue;
+    const line = (x >> 8) & 15, st = (x >> 4) & 15, l = x & 15, m = A[line];
+    const nb = m & ((line > 0 ? A[line - 1] : 0) | (line < 9 ? A[line + 1] : 0)), rm = RUNS[m];
+    for (let j = 0; j < rm.length; j++) {
+      const run = rm[j], L = POPC[run], s0 = CTZ[run];
+      if (st < s0 || st >= s0 + L) continue;
+      if ((run & nb) !== 0 || (L >> 1) - 1 !== t) break;
+      const ra = st - s0, rb = L - ra - l, ka = (ra >= 2 ? 1 : 0) + (rb >= 2 ? 1 : 0);
+      if (!enc && ka === 0) return x;
+      if (enc && ka === 1 && Math.max(ra, rb) === L - 2) return x;
+      break;
+    }
+  }
+  return 0;
+}
 // verificação exata da lista ordenada: rondas com top-K e orçamento de nós crescentes.
 // Devolve { ganha: mv } (vitória provada), { perdida: mv } (todas perdem: devolve a de refutação mais cara)
 // ou null; marca em perde as jogadas provadas perdedoras.
@@ -601,7 +680,89 @@ function verificarRaiz(ord, tFim, perde) {
 // Livro de aberturas: chave = linhas livres (hex) + vez; procura nas 4 simetrias que preservam V/H
 // =====================================================================================
 // @@LIVRO@@
-const LIVRO = {};
+const LIVRO = {
+  '40f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '42f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '46f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '4ef7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 0, 10],
+  '60f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '62f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '66f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '70f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '72f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 1, 9],
+  '78f7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 7, 0, 10],
+  '7e07ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 1, 8],
+  '7e17ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 1, 8],
+  '7e37ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 1, 8],
+  '7e87ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7e97ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ec7ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef40f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef42f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 2, 8],
+  '7ef46f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef4ef7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef60f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 2, 8],
+  '7ef62f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 2, 8],
+  '7ef66f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef70f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef72f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef78f7ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7e07ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7e17ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7e37ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 1, 8],
+  '7ef7e87ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7e97ef7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ec7ef7ef7ef7ef7ef7ef7ef7efV': [0, 8, 1, 8],
+  '7ef7ef40f7ef7ef7ef7ef7ef7ef7efV': [0, 7, 3, 7],
+  '7ef7ef42f7ef7ef7ef7ef7ef7ef7efV': [0, 6, 3, 7],
+  '7ef7ef46f7ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef4ef7ef7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef60f7ef7ef7ef7ef7ef7ef7efV': [0, 8, 3, 7],
+  '7ef7ef62f7ef7ef7ef7ef7ef7ef7efV': [0, 6, 3, 7],
+  '7ef7ef66f7ef7ef7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef70f7ef7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef72f7ef7ef7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef78f7ef7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7e07ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7e17ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7e37ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7e87ef7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7e97ef7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef7ec7ef7ef7ef7ef7ef7ef7efV': [0, 8, 1, 8],
+  '7ef7ef7ef40f7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef42f7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef46f7ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7ef4ef7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef60f7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef62f7ef7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef66f7ef7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef70f7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef7ef72f7ef7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef78f7ef7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef7e07ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef7ef7e17ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7ef7e37ef7ef7ef7ef7ef7efV': [0, 6, 1, 8],
+  '7ef7ef7ef7e87ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7ef7e97ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7ef7ec7ef7ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef7ef7ef40f7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef7ef42f7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef7ef46f7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef7ef4ef7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7ef7ef60f7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef7ef62f7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef7ef66f7ef7ef7ef7ef7efV': [0, 1, 0, 10],
+  '7ef7ef7ef7ef70f7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef7ef72f7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef7ef78f7ef7ef7ef7ef7efV': [0, 2, 0, 10],
+  '7ef7ef7ef7ef7e07ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef7ef7ef7e17ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7ef7ef7e37ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef7ef7ef7e87ef7ef7ef7ef7efV': [0, 8, 0, 10],
+  '7ef7ef7ef7ef7e97ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ef7ef7ef7ef7ec7ef7ef7ef7ef7efV': [0, 6, 0, 10],
+  '7ff7ff7ff7ff7ff7ff7ff7ff7ff7ffV': [0, 4, 0, 10],
+};
 // @@FIM_LIVRO@@
 const REV10 = new Int16Array(1024); for (let m = 0; m < 1024; m++) REV10[m] = REVW[10 * 1024 + m];
 function chaveLivro(rows, o) { let k = ''; for (let r = 0; r < 10; r++) k += (rows[r] | 1024).toString(16); return k + o; }
@@ -680,6 +841,13 @@ function escolherJogada(tab, orient, opc) {
     else {
       const L = fLive;
       ultimo.live = L;
+      if (L <= 92 && raizNaTT() === 1) {        // já provada ganha (numa jogada anterior): recuperar a jogada
+        const x = jogadaDaProva(t0 + budget * 0.6, raiz);
+        if (x && raiz.indexOf(x) >= 0) { mv = x; ultimo.estado = 'ganha'; }
+      }
+    }
+    if (!mv && raiz.length > 1) {
+      const L = fLive;
       // ordenação inicial: avaliação depois de 1 jogada (+ ruído mínimo para desempatar)
       const ord = [];
       for (const x of raiz) { make(x); const z = side === 0 ? avaliarML(rowM, colM) : avaliarML(colM, rowM); unmake(x); ord.push({ mv: x, sc: -Math.round(P[0] * z) + rng() * 2 }); }
